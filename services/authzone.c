@@ -79,7 +79,7 @@
 /** when to stop with SOA probes (when exponential timeouts exceed this) */
 #define AUTH_PROBE_TIMEOUT_STOP 1000 /* msec */
 /* auth transfer timeout for TCP connections, in msec */
-#define AUTH_TRANSFER_TIMEOUT 10000 /* msec */
+#define AUTH_TRANSFER_TIMEOUT 60000 /* msec */
 /* auth transfer max backoff for failed tranfers and probes */
 #define AUTH_TRANSFER_MAX_BACKOFF 86400 /* sec */
 /* auth http port number */
