@@ -1558,6 +1558,115 @@ do_cache_remove(struct worker* worker, uint8_t* nm, size_t nmlen,
 	}
 }
 
+static struct lruhash_entry* get_msg_entry(struct slabhash* table,
+        uint8_t* nm, size_t nmlen, uint16_t t, uint16_t c) {
+    struct query_info qinfo;
+    hashvalue_type hash;
+    qinfo.qname = nm;
+    qinfo.qname_len = nmlen;
+    qinfo.qtype = t;
+    qinfo.qclass = c;
+    qinfo.local_alias = NULL;
+    hash = query_info_hash(&qinfo, 0);
+    return slabhash_lookup(table, hash, &qinfo, 1);
+}
+
+static struct lruhash_entry* get_rrset_entry(struct slabhash* table,
+        uint8_t* nm, size_t nmlen, uint16_t t, uint16_t c,
+        uint16_t flags) {
+    struct ub_packed_rrset_key key;
+    key.entry.key = &key;
+    key.rk.dname = nm;
+    key.rk.dname_len = nmlen;
+    key.rk.rrset_class = htons(c);
+    key.rk.type = htons(t);
+    key.rk.flags = flags;
+    key.entry.hash = rrset_key_hash(&key.rk);
+    return slabhash_lookup(table, key.entry.hash, &key, 1);
+}
+
+static void
+do_cache_msg_expire(struct reply_info *rep, time_t expiration)
+{
+    if(rep->ttl > expiration) {
+        rep->ttl = expiration;
+        rep->prefetch_ttl = expiration;
+        rep->serve_expired_ttl = expiration;
+    }
+}
+
+/** flush something from rrset and msg caches */
+static void
+do_chain_remove(struct worker* worker, uint8_t* nm, size_t nmlen,
+                uint16_t t, uint16_t c)
+{
+    struct reply_info* rep;
+    size_t i;
+    uint8_t* sname;
+    size_t snamelen;
+    time_t expiration;
+    struct lruhash_entry* entry;
+
+    entry = get_msg_entry(worker->env.msg_cache, nm, nmlen, t, c);
+    if (!entry) {
+        return;
+    }
+    rep = (struct reply_info*)entry->data;
+
+    expiration = *worker->env.now;
+    expiration -= 3; /* handle 3 seconds skew between threads */
+    sname = nm;
+    snamelen = nmlen;
+    for(i=0; i<rep->an_numrrsets; i++) {
+        uint16_t rr_type = ntohs(rep->rrsets[i]->rk.type);
+        uint16_t rr_class = ntohs(rep->rrsets[i]->rk.rrset_class);
+        struct lruhash_entry* msg_entry;
+
+        /* remove rrset cache entry */
+        struct lruhash_entry* rr_entry = get_rrset_entry(
+                &worker->env.rrset_cache->table, sname, snamelen,
+                rr_type, rr_class, 0);
+        if (rr_entry) {
+            struct packed_rrset_data* data =
+                    (struct packed_rrset_data*)rr_entry->data;
+            if(data->ttl > expiration) {
+                data->ttl = expiration;
+            }
+        }
+
+        /* remove msg cache entry */
+        msg_entry = get_msg_entry(worker->env.msg_cache, sname, snamelen, rr_type, rr_class);
+        if (msg_entry) {
+            struct reply_info *rr_rep = (struct reply_info *)msg_entry->data;
+            do_cache_msg_expire(rr_rep, expiration);
+            lock_rw_unlock(&msg_entry->lock);
+        }
+
+        /* follow the cname chain */
+        if(rr_type != LDNS_RR_TYPE_CNAME && rr_type != LDNS_RR_TYPE_DNAME) {
+            if (rr_entry) {
+                lock_rw_unlock(&rr_entry->lock);
+            }
+            break;
+        }
+        /* verify that owner matches current sname */
+        if(query_dname_compare(sname, rep->rrsets[i]->rk.dname) != 0){
+            if (rr_entry) {
+                lock_rw_unlock(&rr_entry->lock);
+            }
+            break;
+        }
+        get_cname_target(rep->rrsets[i], &sname, &snamelen);
+
+        if (rr_entry) {
+            lock_rw_unlock(&rr_entry->lock);
+        }
+    }
+
+    do_cache_msg_expire(rep, expiration);
+    lock_rw_unlock(&entry->lock);
+}
+
 /** flush a type */
 static void
 do_flush_type(RES* ssl, struct worker* worker, char* arg)
@@ -1929,6 +2038,30 @@ do_flush_name(RES* ssl, struct worker* w, char* arg)
 	
 	free(nm);
 	send_ok(ssl);
+}
+
+static void
+do_flush_chain(RES* ssl, struct worker* w, char* arg)
+{
+    uint8_t* nm;
+    int nmlabs;
+    size_t nmlen;
+    if(!parse_arg_name(ssl, arg, &nm, &nmlen, &nmlabs))
+        return;
+
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_A, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_AAAA, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_NS, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_SOA, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_CNAME, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_DNAME, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_MX, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_PTR, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_SRV, LDNS_RR_CLASS_IN);
+    do_chain_remove(w, nm, nmlen, LDNS_RR_TYPE_NAPTR, LDNS_RR_CLASS_IN);
+
+    free(nm);
+    send_ok(ssl);
 }
 
 /** printout a delegation point info */
@@ -3097,6 +3230,8 @@ execute_cmd(struct daemon_remote* rc, RES* ssl, char* cmd,
 		do_flush_infra(ssl, worker, skipwhite(p+11));
 	} else if(cmdcmp(p, "flush", 5)) {
 		do_flush_name(ssl, worker, skipwhite(p+5));
+    } else if(cmdcmp(p, "flush_chain", 11)) {
+        do_flush_chain(ssl, worker, skipwhite(p+11));
 	} else if(cmdcmp(p, "dump_requestlist", 16)) {
 		do_dump_requestlist(ssl, worker);
 	} else if(cmdcmp(p, "dump_infra", 10)) {
