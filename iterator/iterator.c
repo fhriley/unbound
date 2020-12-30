@@ -41,6 +41,7 @@
  */
 
 #include "config.h"
+#include "daemon/worker.h"
 #include "iterator/iterator.h"
 #include "iterator/iter_utils.h"
 #include "iterator/iter_hints.h"
@@ -1206,6 +1207,45 @@ forward_request(struct module_qstate* qstate, struct iter_qstate* iq)
 	return 1;
 }
 
+/** convert dns message in buffer to return_msg */
+static int
+parse_data(struct module_qstate* qstate, struct iter_qstate* iq, struct sldns_buffer* buf)
+{
+    struct msg_parse* prs;
+    struct edns_data edns;
+    size_t lim = sldns_buffer_limit(buf);
+    if(lim < LDNS_HEADER_SIZE)
+        return 0; /* too short */
+
+    /* parse DNS packet */
+    regional_free_all(qstate->env->scratch);
+    prs = (struct msg_parse*)regional_alloc(qstate->env->scratch,
+                                            sizeof(struct msg_parse));
+    if(!prs) {
+        return 0; /* out of memory */
+    }
+    memset(prs, 0, sizeof(*prs));
+    memset(&edns, 0, sizeof(edns));
+    //sldns_buffer_set_limit(buf, lim - sizeof(expiry)-sizeof(timestamp));
+    if(parse_packet(buf, prs, qstate->env->scratch) != LDNS_RCODE_NOERROR) {
+        sldns_buffer_set_limit(buf, lim);
+        return 0;
+    }
+    if(parse_extract_edns(prs, &edns, qstate->env->scratch) !=
+       LDNS_RCODE_NOERROR) {
+        sldns_buffer_set_limit(buf, lim);
+        return 0;
+    }
+
+    iq->response = dns_alloc_msg(buf, prs, qstate->region);
+    sldns_buffer_set_limit(buf, lim);
+    if(!iq->response) {
+        return 0;
+    }
+
+    return 1;
+}
+
 /** 
  * Process the initial part of the request handling. This state roughly
  * corresponds to resolver algorithms steps 1 (find answer in cache) and 2
@@ -1282,6 +1322,36 @@ processInitRequest(struct module_qstate* qstate, struct iter_qstate* iq,
 
 	/* This either results in a query restart (CNAME cache response), a
 	 * terminating response (ANSWER), or a cache miss (null). */
+
+    if(qstate->env->auth_zones) {
+        struct query_info* qinfo = &iq->qchase;
+        struct module_env* env = qstate->env;
+        sldns_buffer_clear(env->scratch_buffer);
+        sldns_buffer_write_u16(env->scratch_buffer, id);
+        sldns_buffer_write_u16(env->scratch_buffer, iq->chase_flags);
+        struct edns_data edns;
+        memset(&edns, 0, sizeof(edns));
+        edns.edns_present = 1;
+        edns.bits = EDNS_DO;
+        edns.ext_rcode = 0;
+        edns.edns_version = EDNS_ADVERTISED_VERSION;
+        edns.udp_size = EDNS_ADVERTISED_SIZE;
+        if (qstate->reply && qstate->client_info &&
+                rpz_apply_qname_trigger(env->auth_zones, env, qinfo,
+                &edns, env->scratch_buffer,
+                qstate->region,
+                qstate->reply,
+                qstate->client_info->taglist,
+                qstate->client_info->taglen,
+                &env->worker->stats)) {
+            if (parse_data(qstate, iq, env->scratch_buffer)) {
+                return next_state(iq, QUERY_RESP_STATE);
+            } else {
+                errinf(qstate, "failed to create RPZ reply");
+                return error_response(qstate, id, LDNS_RCODE_SERVFAIL);
+            }
+        }
+    }
 	
 	if (iter_stub_fwd_no_cache(qstate, &iq->qchase)) {
 		/* Asked to not query cache. */
