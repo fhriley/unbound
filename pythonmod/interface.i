@@ -609,8 +609,28 @@ struct mesh_reply {
    struct comm_reply query_reply;
 };
 
+enum comm_point_type {
+    /** UDP socket - handle datagrams. */
+    comm_udp,
+    /** TCP accept socket - only creates handlers if readable. */
+    comm_tcp_accept,
+    /** TCP handler socket - handle byteperbyte readwrite. */
+    comm_tcp,
+    /** HTTP handler socket */
+    comm_http,
+    /** AF_UNIX socket - for internal commands. */
+    comm_local,
+    /** raw - not DNS format - for pipe readers and writers */
+    comm_raw
+};
+
+struct comm_point {
+    enum comm_point_type type;
+};
+
 %rename(_addr) comm_reply::addr;
 struct comm_reply {
+   struct comm_point* c;
    struct sockaddr_storage addr;
 };
 
@@ -1549,7 +1569,6 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         PyObject *py_args, *py_kwargs, *result;
         int res = 0;
         double py_start_time = start_time.tv_sec + start_time.tv_usec / 1e6;
-
         PyGILState_STATE gstate = PyGILState_Ensure();
         func = (PyObject *) python_callback;
         py_edns = SWIG_NewPointerObj((void*) edns, SWIGTYPE_p_edns_data, 0);
@@ -1563,8 +1582,19 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         py_region = SWIG_NewPointerObj((void*) region, SWIGTYPE_p_regional, 0);
         py_args = Py_BuildValue("(OOOiOOO)", py_qinfo, py_qstate, py_rep,
             rcode, py_edns, py_opt_list_out, py_region);
-        py_kwargs = Py_BuildValue("{s:O,s:d}", "repinfo", py_repinfo, "start_time",
-                                  py_start_time);
+        struct pythonmod_qstate* pq = NULL;
+        if (qstate)
+        {
+            pq = (struct pythonmod_qstate *) qstate->minfo[id];
+        }
+        if (pq)
+        {
+            py_kwargs = Py_BuildValue("{s:O,s:d,s:O}", "repinfo", py_repinfo, "start_time",
+                                      py_start_time, "qdata", pq->data);
+        } else {
+            py_kwargs = Py_BuildValue("{s:O,s:d}", "repinfo", py_repinfo, "start_time",
+                                      py_start_time);
+        }
         result = PyObject_Call(func, py_args, py_kwargs);
         Py_XDECREF(py_edns);
         Py_XDECREF(py_qstate);
@@ -1634,7 +1664,21 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         PyObject *py_region = SWIG_NewPointerObj((void*) region, SWIGTYPE_p_regional, 0);
 
         PyObject *py_args = Py_BuildValue("(OiOOOO)", py_qinfo, flags, py_qstate, py_addr, py_zone, py_region);
-        PyObject *py_kwargs = Py_BuildValue("{}");
+        PyObject *py_kwargs;
+        struct pythonmod_qstate* pq = NULL;
+        if (qstate)
+        {
+            pq = (struct pythonmod_qstate *) qstate->minfo[id];
+        }
+        if (!pq)
+        {
+            /* create qstate */
+            pq = qstate->minfo[id] = malloc(sizeof(struct pythonmod_qstate));
+
+            /* Initialize per query data */
+            pq->data = PyDict_New();
+        }
+        py_kwargs = Py_BuildValue("{s:O}", "qdata", pq->data);
         PyObject *result = PyObject_Call(func, py_args, py_kwargs);
         if (result) {
             res = PyInt_AsLong(result);
@@ -1676,7 +1720,20 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         PyObject *py_response = SWIG_NewPointerObj((void*) response, SWIGTYPE_p_dns_msg, 0);
 
         PyObject *py_args = Py_BuildValue("(OO)", py_qstate, py_response);
-        PyObject *py_kwargs = Py_BuildValue("{}");
+        PyObject *py_kwargs;
+        struct pythonmod_qstate* pq = NULL;
+        if (qstate)
+        {
+            pq = (struct pythonmod_qstate *) qstate->minfo[id];
+        }
+        if (pq)
+        {
+            py_kwargs = Py_BuildValue("{s:O}", "qdata", pq->data);
+        }
+        else
+        {
+            py_kwargs = Py_BuildValue("{}");
+        }
         PyObject *result = PyObject_Call(func, py_args, py_kwargs);
         if (result) {
             res = PyInt_AsLong(result);
@@ -1714,7 +1771,20 @@ int edns_opt_list_append(struct edns_option** list, uint16_t code, size_t len,
         PyObject *py_qstate = SWIG_NewPointerObj((void*) qstate, SWIGTYPE_p_module_qstate, 0);
 
         PyObject *py_args = Py_BuildValue("(O)", py_qstate);
-        PyObject *py_kwargs = Py_BuildValue("{}");
+        PyObject *py_kwargs;
+        struct pythonmod_qstate* pq = NULL;
+        if (qstate)
+        {
+            pq = (struct pythonmod_qstate *) qstate->minfo[id];
+        }
+        if (pq)
+        {
+            py_kwargs = Py_BuildValue("{s:O}", "qdata", pq->data);
+        }
+        else
+        {
+            py_kwargs = Py_BuildValue("{}");
+        }
         PyObject *result = PyObject_Call(func, py_args, py_kwargs);
         if (result) {
             res = PyInt_AsLong(result);
